@@ -11,6 +11,17 @@
 
 static const char *TAG = "wifi_sniffer";
 
+// 全局嗅探信道：0 = 全信道跳频，非0 = 锁定该信道
+uint8_t g_sniffer_channel = 0;
+bool g_channel_updated = false;
+
+// 供 Web 服务器调用，动态设置信道
+void set_sniffer_channel(uint8_t channel) {
+    g_sniffer_channel = channel;
+    g_channel_updated = true;
+    ESP_LOGI(TAG, "Sniffer channel updated to: %d", channel);
+}
+
 // Maximum number of packets to store
 #define MAX_PACKETS_QUEUE 32
 #define MAX_PACKET_SIZE 1024
@@ -40,7 +51,6 @@ static const uint8_t channels_count = sizeof(channels)/sizeof(channels[0]);
 // Forward declaration
 static void wifi_sniffer_packet_handler(void *buf, wifi_promiscuous_pkt_type_t type);
 static void channel_hopper_task(void *pvParameters);
-static void single_channel_retry_task(void *pvParameters);
 
 // Start WiFi sniffer
 bool start_wifi_sniffer(uint8_t channel, uint8_t filter_type) {
@@ -86,6 +96,7 @@ bool start_wifi_sniffer(uint8_t channel, uint8_t filter_type) {
     // Save configuration
     current_channel = channel;
     current_filter = filter_type;
+    set_sniffer_channel(channel);
     
     // Get current WiFi mode and save it
     wifi_mode_t original_mode;
@@ -126,31 +137,29 @@ bool start_wifi_sniffer(uint8_t channel, uint8_t filter_type) {
     // Enable promiscuous mode
     esp_wifi_set_promiscuous(true);
     
-    // Set the channel or start channel hopping
-    if (channel == 0) {
-        // Start channel hopping task
-        xTaskCreate(channel_hopper_task, "channel_hopper", 2048, NULL, 5, &channel_hopper_task_handle);
-    } else {
-        // Set specific channel
-        esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set initial channel %d: %s", channel, esp_err_to_name(err));
-            ESP_LOGI(TAG, "Will retry setting channel in background");
-            
-            // Create a parameter structure to pass the channel
-            uint8_t *channel_param = malloc(sizeof(uint8_t));
-            if (channel_param) {
-                *channel_param = channel;
-                
-                // Start a task to keep trying to set the channel
-                xTaskCreate(single_channel_retry_task, "channel_retry", 2048, channel_param, 5, &channel_hopper_task_handle);
-            }
+    // 统一创建信道管理任务
+    // 不管 channel 是 0 还是具体信道，都交给 channel_hopper_task 处理
+    if (channel_hopper_task_handle == NULL) {
+        BaseType_t ret = xTaskCreate(
+            channel_hopper_task,
+            "channel_hopper",
+            2048,
+            NULL,
+            5,
+            &channel_hopper_task_handle
+        );
+
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create channel hopper task");
+            is_sniffer_running = false;
+            xSemaphoreGive(sniffer_running_mutex);
+            return false;
         }
     }
-    
+
     is_sniffer_running = true;
     xSemaphoreGive(sniffer_running_mutex);
-    
+
     ESP_LOGI(TAG, "WiFi sniffer started successfully");
     return true;
 }
@@ -217,41 +226,25 @@ int get_captured_packets(void **packets, int max_packets) {
 // Channel hopper task
 static void channel_hopper_task(void *pvParameters) {
     int current_idx = 0;
-    int failed_attempts = 0;
-    
     ESP_LOGI(TAG, "Channel hopper task started");
-    
+
     while (1) {
-        // Use each channel in sequence
-        uint8_t new_channel = channels[current_idx];
-        
-        // Try to set the channel and check for errors
-        esp_err_t err = esp_wifi_set_channel(new_channel, WIFI_SECOND_CHAN_NONE);
-        
-        if (err == ESP_OK) {
-            // Channel set successfully
-            ESP_LOGD(TAG, "Hopped to channel %d", new_channel);
-            current_idx = (current_idx + 1) % channels_count;
-            failed_attempts = 0;
-        } else {
-            // Failed to set channel
-            failed_attempts++;
-            ESP_LOGD(TAG, "Failed to hop to channel %d: %s (attempt %d)", 
-                    new_channel, esp_err_to_name(err), failed_attempts);
-            
-            // If we've failed multiple times, wait longer before trying again
-            if (failed_attempts > 5) {
-                ESP_LOGW(TAG, "Multiple channel hop failures, waiting longer...");
-                vTaskDelay((CHANNEL_HOP_INTERVAL_MS * 5) / portTICK_PERIOD_MS);
-                
-                // Reset failed attempts counter after waiting
-                failed_attempts = 0;
-                continue;
+        if (g_sniffer_channel != 0) {
+            // 锁定到指定信道
+            esp_err_t err = esp_wifi_set_channel(g_sniffer_channel, WIFI_SECOND_CHAN_NONE);
+            if (err == ESP_OK) {
+                ESP_LOGD(TAG, "Locked to channel %d", g_sniffer_channel);
+            } else {
+                ESP_LOGW(TAG, "Failed to lock channel %d: %s", g_sniffer_channel, esp_err_to_name(err));
             }
+            vTaskDelay(pdMS_TO_TICKS(200)); // 锁定状态下稍作等待
+        } else {
+            // 全信道跳频
+            uint8_t new_channel = channels[current_idx];
+            esp_wifi_set_channel(new_channel, WIFI_SECOND_CHAN_NONE);
+            current_idx = (current_idx + 1) % channels_count;
+            vTaskDelay(CHANNEL_HOP_INTERVAL_MS / portTICK_PERIOD_MS);
         }
-        
-        // Wait before hopping again
-        vTaskDelay(CHANNEL_HOP_INTERVAL_MS / portTICK_PERIOD_MS);
     }
 }
 
@@ -316,39 +309,3 @@ static void wifi_sniffer_packet_handler(void *buf, wifi_promiscuous_pkt_type_t t
         }
     }
 }
-
-// Task to retry setting a single channel
-static void single_channel_retry_task(void *pvParameters) {
-    uint8_t target_channel = *(uint8_t*)pvParameters;
-    int retry_count = 0;
-    
-    // Free the parameter memory
-    free(pvParameters);
-    
-    ESP_LOGI(TAG, "Channel retry task started for channel %d", target_channel);
-    
-    while (is_sniffer_running && retry_count < 20) { // Limit retries to avoid infinite loop
-        esp_err_t err = esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
-        
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Successfully set channel to %d after %d retries", target_channel, retry_count);
-            break;
-        }
-        
-        retry_count++;
-        ESP_LOGD(TAG, "Retry %d: Failed to set channel %d: %s", 
-                retry_count, target_channel, esp_err_to_name(err));
-        
-        // Exponential backoff for retries
-        int delay_ms = CHANNEL_HOP_INTERVAL_MS * (1 << (retry_count > 5 ? 5 : retry_count));
-        vTaskDelay(delay_ms / portTICK_PERIOD_MS);
-    }
-    
-    if (retry_count >= 20) {
-        ESP_LOGW(TAG, "Failed to set channel %d after maximum retries", target_channel);
-    }
-    
-    // Delete self
-    channel_hopper_task_handle = NULL;
-    vTaskDelete(NULL);
-} 

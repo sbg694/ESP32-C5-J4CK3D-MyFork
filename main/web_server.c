@@ -8,11 +8,7 @@
 #include "esp_chip_info.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
-
-// Include our wifi sniffer functions
-extern bool start_wifi_sniffer(uint8_t channel, uint8_t filter_type);
-extern bool stop_wifi_sniffer(void);
-extern int get_captured_packets(void **packets, int max_packets);
+#include "wifi_sniffer.h"
 
 // Define struct to avoid including wifi_init.c header
 typedef struct {
@@ -1080,6 +1076,26 @@ static const char index_html[] =
 "        document.addEventListener('DOMContentLoaded', function() {\n"
 "            loadSystemInfo();\n"
 "            initSettingsPage();\n"
+"            \n"
+"            // 动态切换信道\n"
+"            document.getElementById('sniff-channel').addEventListener('change', function() {\n"
+"                const newChannel = this.value;\n"
+"                console.log(`%c [SNIFF] Channel changed to ${newChannel}`, 'color: #0f0; background: #000');\n"
+"                if (sniffing) {\n"
+"                    fetch(`/api/sniff/channel?channel=${newChannel}`)\n"
+"                        .then(response => response.json())\n"
+"                        .then(data => {\n"
+"                            if (data.status === 'success') {\n"
+"                                const statusElement = document.getElementById('sniff-status');\n"
+"                                statusElement.textContent = `CH4NN3L CH4NG3D T0 ${newChannel === '0' ? 'ALL' : newChannel}`;\n"
+"                                statusElement.className = 'status success';\n"
+"                            }\n"
+"                        })\n"
+"                        .catch(error => {\n"
+"                            console.error('Failed to change channel:', error);\n"
+"                        });\n"
+"                }\n"
+"            });\n"
 "        });\n"
 "    </script>\n"
 "</body>\n"
@@ -1591,6 +1607,33 @@ static esp_err_t api_sniff_stop_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// API handler for changing sniffer channel dynamically
+static esp_err_t api_sniff_channel_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+
+    char buf[100];
+    int channel = 0; // 默认全信道
+
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char param[16];
+        if (httpd_query_key_value(buf, "channel", param, sizeof(param)) == ESP_OK) {
+            channel = atoi(param);
+        }
+    }
+
+    set_sniffer_channel((uint8_t)channel);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status", "success");
+    cJSON_AddNumberToObject(root, "channel", channel);
+    char *json_response = cJSON_PrintUnformatted(root);
+    httpd_resp_sendstr(req, json_response);
+    free(json_response);
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
 // Helper function to format MAC address
 static void format_mac_addr(char *dest, const uint8_t *addr) {
     snprintf(dest, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -1755,6 +1798,14 @@ esp_err_t register_uri_handlers(httpd_handle_t server) {
         .user_ctx = NULL
     };
     httpd_register_uri_handler(server, &sniff_stop_handler);
+
+    httpd_uri_t sniff_channel_handler = {
+        .uri = "/api/sniff/channel",
+        .method = HTTP_GET,
+        .handler = api_sniff_channel_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &sniff_channel_handler);
     
     httpd_uri_t sniff_packets_handler = {
         .uri = "/api/sniff/packets",

@@ -36,4 +36,13 @@ bool stop_wifi_sniffer(void);
  */
 int get_captured_packets(void **packets, int max_packets);
 
+/* 全局变量：当前嗅探信道，0 表示跳频，1~13 表示固定信道 */
+extern uint8_t g_sniffer_channel;
+
+/**
+ * @brief 设置嗅探器信道
+ * @param channel 0 表示跳频，1~13 表示固定信道
+ */
+void set_sniffer_channel(uint8_t channel);
+
 #endif /* WIFI_SNIFFER_H */ 
